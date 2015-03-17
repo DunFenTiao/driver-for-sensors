@@ -1,0 +1,340 @@
+/*
+ * tmg3992.c: driver for tmg3992 sensor.
+ *
+ */
+#include <linux/kernel.h>
+#include <linux/module.h>
+#include <linux/fs.h>
+#include <linux/cdev.h>
+#include <linux/device.h>
+#include <linux/slab.h>
+#include <asm/uaccess.h>
+#include <linux/byteorder/generic.h>
+
+#include <linux/i2c.h>
+#include <linux/delay.h>
+#include <linux/types.h>/*ssize_t...*/
+
+#include <linux/gpio.h>
+#include <linux/interrupt.h>
+
+#include "nl.h"
+#include "tmg3992.h"
+
+#define PINT_PIN_GPIO15 15
+#define verbose(x)
+
+static struct i2c_board_info tmg3992_info = {
+    I2C_BOARD_INFO("tmg3992", 0x39),
+};
+
+struct i2c_client * tmg3992_i2c_client;
+
+typedef struct _TMG3992 {
+    uint16_t Clear;
+    uint16_t Proximity;
+}TMG3992;
+
+TMG3992 tmg_data;
+char *data=NULL;
+
+static int tmg3992_major = 0;
+int service = -1;
+
+
+struct tmg3992_sensor {
+    struct i2c_client   *i2c;
+    TMG3992 sens;
+    const char * name;
+};
+/*---------------tmg-----------------*/
+size_t setTmgEnable(struct i2c_client *client,uint8_t address,uint8_t source)
+{
+    uint8_t val;
+    val = i2c_smbus_read_byte_data(client,address);
+    source = val | source;
+    verbose(printk("-->%s, address:%x, register:%x, new value:%x\n", __func__, address, val, source));
+    i2c_smbus_write_byte_data(client,address,source);
+    return 0;
+}
+
+size_t clearInterrupt(struct i2c_client *client)
+{
+    int val;
+    val = i2c_smbus_read_byte_data(client,PCLEAR);
+    return 0;
+}
+
+size_t getTmgProximity(struct i2c_client *client, TMG3992* tmg3992)
+{
+    verbose(printk("-->%s\n", __func__));
+
+    uint8_t  buffer[1]={0};
+    uint8_t bytenum=1;
+    size_t ret=0;
+    uint8_t i=0;
+	
+    /*set enable pro*/
+    setTmgEnable(client,ENABLEADDRESS,ENPRO);
+    ret=i2c_smbus_read_i2c_block_data(client,PDATA,bytenum,buffer);
+
+    if(ret < 0){
+       printk("%s, Failed to read tmg\n", __func__);
+       return ret;
+    }
+    
+    tmg_data.Proximity=(uint16_t)buffer[0];
+
+    verbose(printk("tmg3992->Proximity=%d\n",tmg_data.Proximity));
+    return ret;
+}
+
+size_t getTmgProIntMode(struct i2c_client *client,TMG3992* tmg3992)
+{	
+	
+    uint8_t  buffer[1]={0};
+    uint8_t bytenum=1;
+    size_t ret=0;
+    uint8_t i=0;
+
+    //setTmgEnable(client,PCLEAR,0);
+		
+    ret=i2c_smbus_read_i2c_block_data(client,PDATA,bytenum,buffer);
+
+    if(ret < 0){
+       printk("%s, Failed to read tmg\n", __func__);
+       return ret;
+    }
+    
+    tmg_data.Proximity=(uint16_t)buffer[0];
+
+    verbose(printk("tmg3992->Proximity=%d\n",tmg_data.Proximity));
+    return ret;
+}
+
+
+size_t getTmgALS(struct i2c_client *client, TMG3992* tmg3992)
+{
+    verbose(printk("-->%s\n", __func__));
+    uint8_t  rddata[2]={0,0};
+    uint8_t bytenum=2;
+    int ret;
+    uint8_t i;
+    setTmgEnable(client,ENABLEADDRESS,ENALS);
+
+    ret=i2c_smbus_read_i2c_block_data(client,CDATAL,bytenum,rddata);
+
+    if(ret < 0){
+       printk("%s, failed to read tmg,ret=%d \n", __func__, ret);
+       return -1;
+    }
+
+    tmg_data.Clear=(((uint16_t)rddata[1]) << 8) | rddata[0];
+
+    verbose(printk("tmg3992->Clear=%d\n",tmg_data.Clear));
+    return ret;
+
+}
+
+
+static irqreturn_t TmgTopIntHandler(int irq,void *dev_id)
+{
+    //clearInterrupt(tmg3992_i2c_client);
+    verbose(printk("TMGINThandler:irq=%d\n",irq));
+    printk("TMGINThandler:irq=%d\n",irq);
+    return IRQ_WAKE_THREAD;
+}
+
+static irqreturn_t TmgThreadedIntHandler(int irq,void *dev_id)
+{
+    if (tmg3992_i2c_client)
+        clearInterrupt(tmg3992_i2c_client);
+    verbose(printk("TMGThreadedhandler:irq=%d\n",irq));
+    printk("TMGThreadedhandler:irq=%d\n",irq);
+    return IRQ_HANDLED;
+}
+
+static int tmg3992_remove(struct i2c_client *client)
+{
+    struct tmg3992_sensor *tmg = i2c_get_clientdata(client);
+
+    printk("tmg3992: i2c detatch called for %s\n", tmg->name);
+    
+    disable_irq(gpio_to_irq(PINT_PIN_GPIO15));
+    free_irq(gpio_to_irq(PINT_PIN_GPIO15),NULL);
+    gpio_free(PINT_PIN_GPIO15);    
+    kfree(tmg);
+
+    return 0;
+
+}
+
+static int tmg3992_probe(struct i2c_client *client, const struct i2c_device_id *id)
+{
+    uint8_t pithl=0;
+    uint8_t pithh=30;
+    uint8_t pers=0xff;//0001 0000;
+
+    struct tmg3992_sensor *tmg = NULL;
+    tmg = (struct tmg3992_sensor *) kmalloc (sizeof(struct tmg3992_sensor), GFP_KERNEL);
+    if (!tmg) {
+       printk("%s: no enough memory for %d\n",__func__, sizeof(struct tmg3992_sensor)); 
+       return -1;
+    }
+
+    tmg->i2c = client;
+    tmg->name = id->name;
+    i2c_set_clientdata(client, tmg);
+    tmg3992_i2c_client = client; 
+
+    verbose(printk("Enter tmg3992 module! \n"));
+
+    /* gpio */
+    gpio_request(PINT_PIN_GPIO15,"TMG_PINT");	
+    gpio_direction_input(PINT_PIN_GPIO15);
+    /* request interrupt */
+    unsigned long req_flags=IRQF_TRIGGER_RISING|IRQF_TRIGGER_FALLING;
+    int gpioToIrq=gpio_to_irq(PINT_PIN_GPIO15);
+    int ret;
+    if(gpioToIrq!=-1){
+        ret=request_threaded_irq(gpioToIrq,TmgTopIntHandler,TmgThreadedIntHandler, req_flags,"TMG_test",NULL);
+        //ret=request_irq(gpioToIrq,TmgTopIntHandler,req_flags,"TMG_test",NULL);
+        verbose(printk("%s, -->request irq,ret=%d\n", __func__, ret));
+    }
+
+
+    enable_irq(gpio_to_irq(PINT_PIN_GPIO15)); 
+    
+    setTmgEnable(client,ENABLEADDRESS,ENPINT);
+    setTmgEnable(client,PITHL,pithl);
+    setTmgEnable(client,PITHH,pithh);
+    setTmgEnable(client,PPERS,pers);
+    setTmgEnable(client,ALCLEAR,0);
+
+return 0;
+}
+
+/*----------------file_operations-------------------*/
+
+
+ssize_t tmg3992_read(struct file *filp,
+       char __user *buf, size_t count, loff_t *f_pos)
+{
+    verbose(printk("-->read_tmg\n"));
+   
+    /*---------read tmg ------------*/	
+    msleep_interruptible(100);
+    getTmgALS(tmg3992_i2c_client,&tmg_data);
+    msleep_interruptible(100);
+    //getTmgProximity(tmg3992_i2c_client,&tmg_data);
+    getTmgProIntMode(tmg3992_i2c_client,&tmg_data);    
+    msleep_interruptible(100);
+
+    copy_to_user(buf, &tmg_data,sizeof(tmg_data));
+   
+
+    return sizeof(tmg_data);
+
+}
+
+ssize_t tmg3992_write(struct file *filp,
+       const char __user *buf, size_t count, loff_t *f_pos)
+{
+    return 0;
+}
+
+/*  file operations :Open & close the device; in fact, there's nothing to do.*/
+int tmg3992_open_release(struct inode *inode, struct file *filp)
+{
+    verbose(printk("-->%s\n", __func__));
+    return 0;
+}
+static struct file_operations tmg3992_ops = {
+    .owner = THIS_MODULE,
+    .open  = tmg3992_open_release,
+    .release = tmg3992_open_release,
+    .read = tmg3992_read,
+    .write = tmg3992_write,
+};
+
+
+/*------------------i2c_driver ----------------*/
+static const struct i2c_device_id tmg3992_id[] = {
+    { "tmg3992", 0 },
+    { }
+};
+
+MODULE_DEVICE_TABLE(i2c, tmg3992_id);
+
+static struct i2c_driver tmg3992_drv = {
+    .driver = {
+        .name   = "tmg3992",
+    },
+       .probe      = tmg3992_probe,
+       .remove     = tmg3992_remove,
+       .id_table   = tmg3992_id,
+};
+
+
+/*------------------init----------------*/
+static struct cdev tmg3992_dev;
+
+static int tmg3992_dev_init(void)
+{
+
+    int result;
+    struct i2c_adapter *i2c_adap;
+
+    dev_t dev = MKDEV(tmg3992_major, 0);
+
+    verbose(printk("-->%s\n", __func__));
+
+    /* Figure out our device number. */
+
+    if (tmg3992_major)
+       result = register_chrdev_region(dev, 1, "tmg3992");
+    else {
+       result = alloc_chrdev_region(&dev, 0, 1, "tmg3992");
+       tmg3992_major = MAJOR(dev);
+    }
+    if (result < 0) {
+       verbose(printk(KERN_WARNING "tmg3992: unable to get major %d\n", tmg3992_major));
+       return result;
+    }
+
+    /* i2c get adapter*/
+    i2c_adap=i2c_get_adapter(6);
+    tmg3992_i2c_client=i2c_new_device(i2c_adap,&tmg3992_info);
+    i2c_put_adapter(i2c_adap);
+	
+    /* Now set up cdev. */
+  
+    dev = MKDEV(tmg3992_major, 0);
+    
+    cdev_init(&tmg3992_dev, &tmg3992_ops);
+    tmg3992_dev.owner = THIS_MODULE;
+    result = cdev_add(&tmg3992_dev, dev, 1);
+    if (result)
+       verbose(printk(KERN_NOTICE "Error %d adding tmg3992", result));
+
+    service = nl_register_service("TEST", NULL);
+
+    printk("Init tmg3992 module! %d\n", tmg3992_major);
+    return i2c_add_driver(&tmg3992_drv);
+}
+
+static void tmg3992_dev_cleanup(void)
+{
+    if (data) kfree(data);
+    cdev_del(&tmg3992_dev);
+    unregister_chrdev_region(MKDEV(tmg3992_major,0),1);	
+    nl_remove_service(service);
+    /* remove the device from i2c bus */
+    i2c_unregister_device(tmg3992_i2c_client);
+    /* remove the driver for i2c device*/
+    i2c_del_driver(&tmg3992_drv);
+}
+
+module_init(tmg3992_dev_init);
+module_exit(tmg3992_dev_cleanup);
+MODULE_LICENSE("GPL");

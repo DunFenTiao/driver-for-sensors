@@ -1,0 +1,27 @@
+#ifndef _TMG3992_H_
+#define _TMG3992_H_
+
+#define PINT_PIN_GPIO15 15
+//proximity controls
+#define PDATA 0x9C  
+//interrupt
+#define PPERS 0X8C
+#define PITHL 0x89
+#define PITHH 0x8b
+#define PCLEAR 0XE5
+#define ALCLEAR 0XE7
+//color/ALS controls
+#define CDATAL 0x94 
+#define RDATAL 0x96
+#define GDATAL 0x98
+#define BDATAL 0x9A
+
+//control Register Map
+#define ID 0x92
+#define ENABLEADDRESS 0x80
+//PBEN GEN PIEN AIEN WEN PEN AEN PON
+#define ENALS 0x03 //0000 0011;
+#define ENPRO 0x05 //0000 0101;
+#define ENPINT 0X25
+
+#endif
